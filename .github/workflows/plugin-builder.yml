@@ -73,11 +73,14 @@ jobs:
       - name: Sync Source Code to Vault Directory
         run: |
           PLUGIN_DIR="plugin-vault/plugins/${{ github.event.client_payload.plugin_name }}"
-          METADATA_FILE="$PLUGIN_DIR/CAMELCORE_METADATA.json"
+          METADATA_FILE="$PLUGIN_DIR/CAMELKIT_METADATA.json"
+          LEGACY_METADATA_FILE="$PLUGIN_DIR/CAMELCORE_METADATA.json"
           
           # 1. Stash existing metadata if it exists
           if [ -f "$METADATA_FILE" ]; then
             cp "$METADATA_FILE" /tmp/OLD_METADATA.json
+          elif [ -f "$LEGACY_METADATA_FILE" ]; then
+            cp "$LEGACY_METADATA_FILE" /tmp/OLD_METADATA.json
           else
             rm -f /tmp/OLD_METADATA.json
           fi
@@ -150,7 +153,7 @@ jobs:
       - name: Commit and Push Code to Public Vault Mirror
         run: |
           cd plugin-vault
-          git config user.name "CamelCore Bot"
+          git config user.name "CamelKit Bot"
           git config user.email "bot@evilquest.wiki"
           git add .
           git commit -m "Mirror: ${{ github.event.client_payload.plugin_id }} @ ${{ github.event.client_payload.commit_hash }}" || echo "No files modified."

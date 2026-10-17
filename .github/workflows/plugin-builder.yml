@@ -66,7 +66,7 @@ jobs:
       - name: Checkout Monorepo Vault Mirror
         uses: actions/checkout@v4
         with:
-          repository: 'CamelC0re/plugin-vault'
+          repository: 'CamelKit/Plugin-Vault'
           token: ${{ secrets.VAULT_PUSH_TOKEN }} # Fine-grained org token with write clearance on plugin-vault
           path: 'plugin-vault'
 

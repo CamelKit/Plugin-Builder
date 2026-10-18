@@ -4,79 +4,187 @@ on:
     types: [build_plugin]
 
 jobs:
-  build-and-deploy:
+  notify-building:
+    name: Notify Hub Build Started
     runs-on: ubuntu-latest
-    name: Compile and Mirror Plugin from Secure Cache
-
     steps:
       - name: Report Build Status (Building)
+        env:
+          API_CALLBACK_URL: ${{ secrets.API_CALLBACK_URL }}
+          HUB_CALLBACK_TOKEN: ${{ secrets.HUB_CALLBACK_TOKEN }}
+          PLUGIN_ID: ${{ github.event.client_payload.plugin_id }}
+          COMMIT_HASH: ${{ github.event.client_payload.commit_hash }}
         run: |
-          curl -X POST ${{ secrets.API_CALLBACK_URL }} \
-            -H "Authorization: Bearer ${{ secrets.HUB_CALLBACK_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "plugin_id": "${{ github.event.client_payload.plugin_id }}",
-              "commit_hash": "${{ github.event.client_payload.commit_hash }}",
-              "status": "building"
-            }'
+          if [ -n "$API_CALLBACK_URL" ] && [ -n "$HUB_CALLBACK_TOKEN" ]; then
+            curl -s -X POST "$API_CALLBACK_URL" \
+              -H "Authorization: Bearer $HUB_CALLBACK_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n \
+                --arg id "$PLUGIN_ID" \
+                --arg hash "$COMMIT_HASH" \
+                '{
+                  plugin_id: $id,
+                  commit_hash: $hash,
+                  status: "building"
+                }')"
+          fi
 
-      # 1. Clean workspace setup and download the verified snapshot directly from your R2 bucket
-      # Expected client_payload keys: plugin_id, commit_hash, source_zip_url
-      - name: Download Source Zip from Cloudflare R2
+  compile-plugin:
+    name: Isolated Untrusted Plugin Compilation
+    needs: notify-building
+    runs-on: ubuntu-latest
+    # UNPRIVILEGED: ZERO SECRETS PASSED TO THIS JOB
+    steps:
+      - name: Checkout Builder Repository (Tools)
+        uses: actions/checkout@v4
+        with:
+          path: builder-tools
+
+      - name: Clone Plugin Source from GitHub
+        env:
+          GITHUB_URL: ${{ github.event.client_payload.github_url }}
+          COMMIT_HASH: ${{ github.event.client_payload.commit_hash }}
         run: |
-          echo "Fetching secure source snapshot for plugin: ${{ github.event.client_payload.plugin_id }}"
-          curl -L -H "Authorization: Bearer ${{ secrets.HUB_CALLBACK_TOKEN }}" -o plugin_source.zip "${{ github.event.client_payload.source_zip_url }}"
+          if [ -z "$COMMIT_HASH" ] || [ "$COMMIT_HASH" = "unknown" ]; then
+            echo "::error::Invalid or missing commit hash: '$COMMIT_HASH'"
+            exit 1
+          fi
+          echo "Cloning repository: $GITHUB_URL"
+          git clone "$GITHUB_URL" plugin-workspace
+          cd plugin-workspace
+          git checkout --detach "$COMMIT_HASH"
+          echo "Checked out commit $(git rev-parse HEAD)"
 
-      # 2. Extract the clean source package into the root environment runner directory
-      - name: Extract Source Zip Bundle
+      - name: Run Anti-Bot Security Guard (Pre-build Source)
         run: |
-          unzip plugin_source.zip -d temp_dir
-          # Move contents of the inner root directory (including hidden files) up one level
-          shopt -s dotglob
-          ROOT_DIR=$(ls temp_dir)
-          mv temp_dir/$ROOT_DIR/* .
-          shopt -u dotglob
-          rm -rf temp_dir plugin_source.zip
-          echo "Extraction complete. Current directory structure:"
-          ls -la
+          node builder-tools/scripts/guard-input-fabrication.mjs plugin-workspace
 
-      # 3. Establish the Node.js environment (Locked to v22 as required by the package engine rules)
       - name: Setup Node.js (v22)
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      # 4. Initialize Corepack to match and execute the plugin's exact Yarn 4 lockfile constraints
-      - name: Enable Corepack & Activate Yarn Modern
+      - name: Enable Corepack & Activate Yarn
         run: |
           corepack enable
           corepack prepare yarn@4.9.1 --activate
 
-      # 5. Fetch dependencies using strict lockfile mapping checks to prevent runtime injection attacks
-      # If the node tree differs from the committed manifest lock lines, execution safely breaks
-      - name: Install Dependencies
-        run: yarn install --immutable
+      - name: Install Plugin Dependencies (--ignore-scripts)
+        working-directory: plugin-workspace
+        run: |
+          yarn install --immutable --ignore-scripts
 
-      # 6. Execute the custom esbuild/bundling script layout to compile distribution binaries
-      - name: Run Plugin Compilation
-        run: yarn build
+      - name: Compile Plugin
+        working-directory: plugin-workspace
+        run: |
+          yarn build
 
-      # 7. Mirror the fresh source files directly to your read-only public auditing portal
-      # This preserves community open access (GPLv3 compliance) if the developer nukes their personal repo
+      - name: Verify and Standardize Output Bundle
+        working-directory: plugin-workspace
+        run: |
+          if [ -f "dist/plugin.js" ]; then
+            echo "✅ Verified: dist/plugin.js exists."
+          else
+            echo "⚠️ dist/plugin.js not found. Checking dist for single output bundle..."
+            shopt -s nullglob
+            JS_FILES=(dist/*.js)
+            shopt -u nullglob
+            if [ ${#JS_FILES[@]} -eq 1 ] && [ -f "${JS_FILES[0]}" ]; then
+              echo "Normalizing single bundle ${JS_FILES[0]} -> dist/plugin.js"
+              cp "${JS_FILES[0]}" dist/plugin.js
+            else
+              echo "::error::Build did not produce dist/plugin.js and no single candidate found!"
+              exit 1
+            fi
+          fi
+
+      - name: Run Anti-Bot Security Guard (Post-build Bundle)
+        working-directory: plugin-workspace
+        run: |
+          node ../builder-tools/scripts/guard-input-fabrication.mjs dist/plugin.js
+
+      - name: Extract Metadata & Compute Asset Hash
+        working-directory: plugin-workspace
+        run: |
+          PLUGIN_VERSION=$(jq -r '.version // "1.0.0"' package.json 2>/dev/null || echo "1.0.0")
+          PLUGIN_LICENSE=$(jq -r '.license // "Unknown"' package.json 2>/dev/null || echo "Unknown")
+          RAW_SHA=$(sha256sum dist/plugin.js | awk '{print $1}')
+          ASSET_SHA="sha256:${RAW_SHA}"
+
+          mkdir -p ../build-staging/dist
+          cp -r dist/* ../build-staging/dist/
+          if [ -d data ]; then
+            mkdir -p ../build-staging/data
+            cp -r data/* ../build-staging/data/
+          fi
+
+          mkdir -p ../build-staging/source
+          rsync -av ./ ../build-staging/source/ \
+            --exclude 'node_modules' \
+            --exclude '.git' \
+            --exclude '.yarn' \
+            --exclude 'dist' \
+            --exclude '.pnp.*'
+
+          jq -n \
+            --arg version "$PLUGIN_VERSION" \
+            --arg license "$PLUGIN_LICENSE" \
+            --arg asset_sha "$ASSET_SHA" \
+            '{version: $version, license: $license, asset_sha: $asset_sha}' \
+            > ../build-staging/build-metadata.json
+
+          echo "Build metadata:"
+          cat ../build-staging/build-metadata.json
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-build-artifacts
+          path: build-staging/
+          retention-days: 1
+
+  publish-plugin:
+    name: Publish Verified Plugin Assets & Mirror to Vault
+    needs: compile-plugin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-build-artifacts
+          path: staging
+
+      - name: Parse Metadata
+        id: meta
+        run: |
+          VERSION=$(jq -r '.version' staging/build-metadata.json)
+          LICENSE=$(jq -r '.license' staging/build-metadata.json)
+          ASSET_SHA=$(jq -r '.asset_sha' staging/build-metadata.json)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "license=$LICENSE" >> "$GITHUB_OUTPUT"
+          echo "asset_sha=$ASSET_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Checkout Monorepo Vault Mirror
         uses: actions/checkout@v4
         with:
           repository: 'CamelKit/Plugin-Vault'
-          token: ${{ secrets.VAULT_PUSH_TOKEN }} # Fine-grained org token with write clearance on plugin-vault
+          token: ${{ secrets.VAULT_PUSH_TOKEN }}
           path: 'plugin-vault'
 
       - name: Sync Source Code to Vault Directory
+        env:
+          PLUGIN_NAME: ${{ github.event.client_payload.plugin_name }}
+          AUTHOR: ${{ github.event.client_payload.author }}
+          UPSTREAM_URL: ${{ github.event.client_payload.github_url }}
+          COMMIT_HASH: ${{ github.event.client_payload.commit_hash }}
+          APPROVED_BY: ${{ github.event.client_payload.approved_by }}
+          PLUGIN_VERSION: ${{ steps.meta.outputs.version }}
+          PLUGIN_LICENSE: ${{ steps.meta.outputs.license }}
         run: |
-          PLUGIN_DIR="plugin-vault/plugins/${{ github.event.client_payload.plugin_name }}"
+          PLUGIN_DIR="plugin-vault/plugins/$PLUGIN_NAME"
           METADATA_FILE="$PLUGIN_DIR/CAMELKIT_METADATA.json"
           LEGACY_METADATA_FILE="$PLUGIN_DIR/CAMELCORE_METADATA.json"
-          
-          # 1. Stash existing metadata if it exists
+
           if [ -f "$METADATA_FILE" ]; then
             cp "$METADATA_FILE" /tmp/OLD_METADATA.json
           elif [ -f "$LEGACY_METADATA_FILE" ]; then
@@ -85,30 +193,17 @@ jobs:
             rm -f /tmp/OLD_METADATA.json
           fi
 
-          # 2. Extract versions and licenses from the plugin's package.json
-          PLUGIN_VERSION=$(jq -r '.version // "1.0.0"' package.json 2>/dev/null || echo "1.0.0")
-          PLUGIN_LICENSE=$(jq -r '.license // "Unknown"' package.json 2>/dev/null || echo "Unknown")
-
-          # 3. Evict previous folder history to clear artifacts removed by the author in this revision
           rm -rf "$PLUGIN_DIR"
           mkdir -p "$PLUGIN_DIR"
-          
-          # 4. Sync clean files over into the corresponding sub-folder structure
-          rsync -av . "$PLUGIN_DIR/" \
-            --exclude 'node_modules' \
-            --exclude '.git' \
-            --exclude '.yarn' \
-            --exclude 'plugin-vault' \
-            --exclude 'dist' \
-            --exclude '.pnp.*'
 
-          # 5. Generate Event Block
+          rsync -av staging/source/ "$PLUGIN_DIR/"
+
           EVENT_JSON=$(jq -n \
             --arg version "$PLUGIN_VERSION" \
-            --arg maintainer "${{ github.event.client_payload.author }}" \
-            --arg upstream "${{ github.event.client_payload.github_url }}" \
-            --arg hash "${{ github.event.client_payload.commit_hash }}" \
-            --arg approved_by "${{ github.event.client_payload.approved_by }}" \
+            --arg maintainer "$AUTHOR" \
+            --arg upstream "$UPSTREAM_URL" \
+            --arg hash "$COMMIT_HASH" \
+            --arg approved_by "$APPROVED_BY" \
             --arg timestamp "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             '{
               version: $version,
@@ -120,25 +215,24 @@ jobs:
               timestamp: $timestamp
             }')
 
-          # 6. Reconstruct metadata
           if [ -f /tmp/OLD_METADATA.json ]; then
-            PREV_MAINTAINER=$(jq -r '.current_maintainer' /tmp/OLD_METADATA.json | tr -d '\r\n' | xargs)
-            CURRENT_AUTHOR=$(echo "${{ github.event.client_payload.author }}" | tr -d '\r\n' | xargs)
-            if [ "$PREV_MAINTAINER" != "$CURRENT_AUTHOR" ] && [ "$PREV_MAINTAINER" != "null" ]; then
+            PREV_MAINTAINER=$(jq -r '.current_maintainer // ""' /tmp/OLD_METADATA.json | tr -d '\r\n' | xargs)
+            CURRENT_AUTHOR=$(echo "$AUTHOR" | tr -d '\r\n' | xargs)
+            if [ -n "$PREV_MAINTAINER" ] && [ "$PREV_MAINTAINER" != "null" ] && [ "$PREV_MAINTAINER" != "$CURRENT_AUTHOR" ]; then
               EVENT_JSON=$(echo "$EVENT_JSON" | jq '.event = "project_adoption" | .notes = "Plugin ownership transferred or adopted."')
             fi
-            
-            jq --arg maintainer "${{ github.event.client_payload.author }}" \
+
+            jq --arg maintainer "$AUTHOR" \
                --arg license "$PLUGIN_LICENSE" \
                --argjson event "$EVENT_JSON" \
-               '.current_maintainer = $maintainer | .license = $license | .release_history = ([$event] + .release_history)' \
+               '.current_maintainer = $maintainer | .license = $license | .release_history = ([$event] + (.release_history // []))' \
                /tmp/OLD_METADATA.json > "$METADATA_FILE"
           else
             jq -n \
-              --arg id "${{ github.event.client_payload.plugin_name }}" \
+              --arg id "$PLUGIN_NAME" \
               --arg license "$PLUGIN_LICENSE" \
-              --arg creator "${{ github.event.client_payload.author }}" \
-              --arg maintainer "${{ github.event.client_payload.author }}" \
+              --arg creator "$AUTHOR" \
+              --arg maintainer "$AUTHOR" \
               --argjson event "$EVENT_JSON" \
               '{
                 plugin_id: $id,
@@ -151,15 +245,17 @@ jobs:
           fi
 
       - name: Commit and Push Code to Public Vault Mirror
+        env:
+          PLUGIN_ID: ${{ github.event.client_payload.plugin_id }}
+          COMMIT_HASH: ${{ github.event.client_payload.commit_hash }}
         run: |
           cd plugin-vault
           git config user.name "CamelKit Bot"
-          git config user.email "bot@evilquest.wiki"
+          git config user.email "bot@camelkit.dev"
           git add .
-          git commit -m "Mirror: ${{ github.event.client_payload.plugin_id }} @ ${{ github.event.client_payload.commit_hash }}" || echo "No files modified."
+          git commit -m "Mirror: plugin $PLUGIN_ID @ $COMMIT_HASH" || echo "No files modified."
           git push origin main
 
-      # 8. Deploy the final compiled distribution asset out to production storage channels
       - name: Synchronize Compiled Assets to Cloudflare R2 Bucket
         uses: jakejarvis/s3-sync-action@master
         with:
@@ -168,30 +264,71 @@ jobs:
           AWS_S3_BUCKET: 'camelcore-plugins'
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_S3_ENDPOINT: ${{ secrets.R2_ENDPOINT_URL }} # Format: https://<account_id>.r2.cloudflarestorage.com
-          SOURCE_DIR: 'dist/' # Syncs output binaries (e.g., plugin.js)
-          DEST_DIR: '${{ github.event.client_payload.plugin_id }}'
+          AWS_S3_ENDPOINT: ${{ secrets.R2_ENDPOINT_URL }}
+          SOURCE_DIR: 'staging/dist/'
+          DEST_DIR: ${{ github.event.client_payload.plugin_id }}
 
-      # 9. Ping your Hono core edge framework to instantly shift the client's live production endpoint status to active
-      - name: Execute Hono API Registry Callback
+      - name: Synchronize Data Assets to Cloudflare R2 Bucket
+        if: hashFiles('staging/data/*') != ''
+        uses: jakejarvis/s3-sync-action@master
+        with:
+          args: --acl public-read
+        env:
+          AWS_S3_BUCKET: 'camelcore-plugins'
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_S3_ENDPOINT: ${{ secrets.R2_ENDPOINT_URL }}
+          SOURCE_DIR: 'staging/data/'
+          DEST_DIR: "${{ github.event.client_payload.plugin_id }}/data"
+
+      - name: Execute Hub API Registry Callback
+        env:
+          API_CALLBACK_URL: ${{ secrets.API_CALLBACK_URL }}
+          HUB_CALLBACK_TOKEN: ${{ secrets.HUB_CALLBACK_TOKEN }}
+          PLUGIN_ID: ${{ github.event.client_payload.plugin_id }}
+          COMMIT_HASH: ${{ github.event.client_payload.commit_hash }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET_SHA: ${{ steps.meta.outputs.asset_sha }}
         run: |
-          curl -X POST ${{ secrets.API_CALLBACK_URL }} \
-            -H "Authorization: Bearer ${{ secrets.HUB_CALLBACK_TOKEN }}" \
+          curl -s -X POST "$API_CALLBACK_URL" \
+            -H "Authorization: Bearer $HUB_CALLBACK_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{
-              "plugin_id": "${{ github.event.client_payload.plugin_id }}",
-              "commit_hash": "${{ github.event.client_payload.commit_hash }}",
-              "status": "published"
-            }'
+            -d "$(jq -n \
+              --arg id "$PLUGIN_ID" \
+              --arg hash "$COMMIT_HASH" \
+              --arg ver "$VERSION" \
+              --arg sha "$ASSET_SHA" \
+              '{
+                plugin_id: $id,
+                commit_hash: $hash,
+                status: "published",
+                version: $ver,
+                asset_sha: $sha
+              }')"
 
+  report-failure:
+    name: Report Build Failure Callback
+    needs: [compile-plugin, publish-plugin]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
       - name: Report Build Failure Callback
-        if: failure()
+        env:
+          API_CALLBACK_URL: ${{ secrets.API_CALLBACK_URL }}
+          HUB_CALLBACK_TOKEN: ${{ secrets.HUB_CALLBACK_TOKEN }}
+          PLUGIN_ID: ${{ github.event.client_payload.plugin_id }}
+          COMMIT_HASH: ${{ github.event.client_payload.commit_hash }}
         run: |
-          curl -X POST ${{ secrets.API_CALLBACK_URL }} \
-            -H "Authorization: Bearer ${{ secrets.HUB_CALLBACK_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "plugin_id": "${{ github.event.client_payload.plugin_id }}",
-              "commit_hash": "${{ github.event.client_payload.commit_hash }}",
-              "status": "failed"
-            }'
+          if [ -n "$API_CALLBACK_URL" ] && [ -n "$HUB_CALLBACK_TOKEN" ]; then
+            curl -s -X POST "$API_CALLBACK_URL" \
+              -H "Authorization: Bearer $HUB_CALLBACK_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n \
+                --arg id "$PLUGIN_ID" \
+                --arg hash "$COMMIT_HASH" \
+                '{
+                  plugin_id: $id,
+                  commit_hash: $hash,
+                  status: "failed"
+                }')"
+          fi

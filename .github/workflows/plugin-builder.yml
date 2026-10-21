@@ -16,7 +16,7 @@ jobs:
           COMMIT_HASH: ${{ github.event.client_payload.commit_hash }}
         run: |
           if [ -n "$API_CALLBACK_URL" ] && [ -n "$HUB_CALLBACK_TOKEN" ]; then
-            curl -s -X POST "$API_CALLBACK_URL" \
+            curl -sS -X POST "$API_CALLBACK_URL" \
               -H "Authorization: Bearer $HUB_CALLBACK_TOKEN" \
               -H "Content-Type: application/json" \
               -d "$(jq -n \
@@ -69,10 +69,17 @@ jobs:
           corepack enable
           corepack prepare yarn@4.9.1 --activate
 
-      - name: Install Plugin Dependencies (--ignore-scripts)
+      - name: Install Plugin Dependencies (--mode=skip-build)
         working-directory: plugin-workspace
+        env:
+          YARN_ENABLE_SCRIPTS: "false"
+          YARN_NODE_LINKER: "node-modules"
         run: |
-          yarn install --immutable --ignore-scripts
+          if [ -f "yarn.lock" ]; then
+            yarn install --immutable --mode=skip-build || yarn install --mode=skip-build
+          else
+            yarn install --mode=skip-build
+          fi
 
       - name: Compile Plugin
         working-directory: plugin-workspace
@@ -290,7 +297,7 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
           ASSET_SHA: ${{ steps.meta.outputs.asset_sha }}
         run: |
-          curl -s -X POST "$API_CALLBACK_URL" \
+          curl -sS -X POST "$API_CALLBACK_URL" \
             -H "Authorization: Bearer $HUB_CALLBACK_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$(jq -n \
@@ -320,7 +327,7 @@ jobs:
           COMMIT_HASH: ${{ github.event.client_payload.commit_hash }}
         run: |
           if [ -n "$API_CALLBACK_URL" ] && [ -n "$HUB_CALLBACK_TOKEN" ]; then
-            curl -s -X POST "$API_CALLBACK_URL" \
+            curl -sS -X POST "$API_CALLBACK_URL" \
               -H "Authorization: Bearer $HUB_CALLBACK_TOKEN" \
               -H "Content-Type: application/json" \
               -d "$(jq -n \
